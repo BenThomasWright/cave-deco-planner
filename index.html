@@ -603,6 +603,8 @@ function runSimulation(config) {
     bottomTime: bottomTimeMin,
     totalTime: bottomTimeMin + deco.totalDecoTime,
     maxDepth: Math.max(...path.map(p => p.depth)),
+    exitDepth,
+    ascentRate,
     turnaroundTime: profileMode === 'time' ? waypoints[waypoints.length - 1].x : path.find(p => !p.inbound)?.time || totalTime,
     cns: Math.round(cns + deco.cns),
   };
@@ -1067,10 +1069,10 @@ function ProfileCanvas({ waypoints, onChange, profileMode, results, gasDrops, de
 // ═══════════════════════════════════════════════════════
 function WaypointsTable({ waypoints, onChange, profileMode }) {
   const update = (i, k, v) => {
-    const nw = waypoints.map((w, j) => j === i ? { ...w, [k]: v } : w)
-      .sort((a, b) => a.x - b.x);
+    const nw = waypoints.map((w, j) => j === i ? { ...w, [k]: v } : w);
     onChange(nw);
   };
+  const sortByX = () => onChange([...waypoints].sort((a, b) => a.x - b.x));
   const remove = (i) => waypoints.length > 2 && onChange(waypoints.filter((_, j) => j !== i));
   const add = () => {
     const last = waypoints[waypoints.length - 1] || { x: 0, y: 0 };
@@ -1091,15 +1093,26 @@ function WaypointsTable({ waypoints, onChange, profileMode }) {
             </tr>
           </thead>
           <tbody>
-            {waypoints.map((wp, i) => (
+            {waypoints.map((wp, i) => {
+              const outOfOrder = profileMode === 'cave' && i > 0 && wp.x < waypoints[i - 1].x;
+              return (
               <tr key={i}>
                 <td>
-                  <input type="number" value={wp.x} min={0}
-                    onChange={e => update(i, 'x', Number(e.target.value))} />
+                  <input type="text" inputMode="numeric" value={wp.x}
+                    style={outOfOrder ? { borderColor: 'var(--danger)' } : {}}
+                    onFocus={e => e.target.select()}
+                    onChange={e => update(i, 'x', Number(e.target.value) || 0)}
+                    onBlur={sortByX} />
+                  {outOfOrder && (
+                    <div style={{ color: 'var(--danger)', fontSize: 11, marginTop: 3, fontWeight: 600 }}>
+                      ⚠ Must be after {waypoints[i - 1].x}m
+                    </div>
+                  )}
                 </td>
                 <td>
-                  <input type="number" value={wp.y} min={0}
-                    onChange={e => update(i, 'y', Number(e.target.value))} />
+                  <input type="text" inputMode="numeric" value={wp.y}
+                    onFocus={e => e.target.select()}
+                    onChange={e => update(i, 'y', Number(e.target.value) || 0)} />
                 </td>
                 {profileMode === 'cave' && (
                   <td>
@@ -1115,7 +1128,8 @@ function WaypointsTable({ waypoints, onChange, profileMode }) {
                     disabled={waypoints.length <= 2}>✕</button>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -1127,7 +1141,110 @@ function WaypointsTable({ waypoints, onChange, profileMode }) {
 // ═══════════════════════════════════════════════════════
 // RESULTS PANEL
 // ═══════════════════════════════════════════════════════
-function ResultsPanel({ results, isLoading }) {
+
+function DepthTimeChart({ results }) {
+  const { diveLog, decoSchedule, bottomTime, totalTime, maxDepth, exitDepth, ascentRate, turnaroundTime } = results;
+  const { stops } = decoSchedule;
+  if (!diveLog || diveLog.length === 0) return null;
+
+  const W = 260, H = 130;
+  const PAD = { top: 8, right: 8, bottom: 22, left: 30 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top - PAD.bottom;
+  const yMax = Math.ceil((maxDepth * 1.1) / 10) * 10 || 10;
+
+  const sx = t => PAD.left + (t / totalTime) * cW;
+  const sy = d => PAD.top + (d / yMax) * cH;
+
+  // Bottom phase path
+  const logD = diveLog.map((p, i) =>
+    `${i === 0 ? 'M' : 'L'}${sx(p.time).toFixed(1)},${sy(p.depth).toFixed(1)}`
+  ).join(' ');
+
+  // Deco/ascent phase path
+  const ar = ascentRate || 9;
+  const ed = exitDepth ?? diveLog[diveLog.length - 1]?.depth ?? 0;
+  let decoD = `M${sx(bottomTime).toFixed(1)},${sy(ed).toFixed(1)}`;
+  let t = bottomTime, d = ed;
+  if (stops.length > 0) {
+    t += (d - stops[0].depth) / ar; d = stops[0].depth;
+    decoD += ` L${sx(t).toFixed(1)},${sy(d).toFixed(1)}`;
+    for (let i = 0; i < stops.length; i++) {
+      t += stops[i].time; decoD += ` L${sx(t).toFixed(1)},${sy(stops[i].depth).toFixed(1)}`;
+      const nd = i < stops.length - 1 ? stops[i + 1].depth : 0;
+      t += (stops[i].depth - nd) / ar; d = nd;
+      decoD += ` L${sx(t).toFixed(1)},${sy(d).toFixed(1)}`;
+    }
+  } else {
+    t += d / ar;
+    decoD += ` L${sx(t).toFixed(1)},${sy(0).toFixed(1)}`;
+  }
+
+  const depthStep = yMax <= 20 ? 5 : yMax <= 50 ? 10 : yMax <= 100 ? 20 : 30;
+  const timeStep = totalTime <= 30 ? 5 : totalTime <= 90 ? 15 : totalTime <= 180 ? 30 : 60;
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+      {/* Depth grid */}
+      {Array.from({ length: Math.floor(yMax / depthStep) + 1 }, (_, i) => i * depthStep).map(dep => (
+        <g key={dep}>
+          <line x1={PAD.left} y1={sy(dep)} x2={W - PAD.right} y2={sy(dep)} stroke="var(--border)" strokeWidth="0.5" />
+          <text x={PAD.left - 3} y={sy(dep) + 3} textAnchor="end" fontSize="8" fill="var(--muted)">{dep}</text>
+        </g>
+      ))}
+      {/* Time grid */}
+      {Array.from({ length: Math.floor(totalTime / timeStep) + 1 }, (_, i) => i * timeStep).map(ti => (
+        <g key={ti}>
+          <line x1={sx(ti)} y1={PAD.top} x2={sx(ti)} y2={H - PAD.bottom} stroke="var(--border)" strokeWidth="0.5" />
+          <text x={sx(ti)} y={H - PAD.bottom + 10} textAnchor="middle" fontSize="8" fill="var(--muted)">{ti}</text>
+        </g>
+      ))}
+      {/* Turnaround marker */}
+      {turnaroundTime > 0 && turnaroundTime < bottomTime && (
+        <line x1={sx(turnaroundTime)} y1={PAD.top} x2={sx(turnaroundTime)} y2={H - PAD.bottom}
+          stroke="var(--accent)" strokeWidth="1" strokeDasharray="3,2" opacity="0.5" />
+      )}
+      {/* Bottom phase */}
+      <path d={logD} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
+      {/* Deco/ascent phase */}
+      <path d={decoD} fill="none" stroke="var(--success)" strokeWidth="1.5" strokeDasharray="4,2" />
+      {/* Axis label */}
+      <text x={W / 2} y={H - 3} textAnchor="middle" fontSize="8" fill="var(--muted)">Time (min)</text>
+      <text x={6} y={H / 2} textAnchor="middle" fontSize="8" fill="var(--muted)"
+        transform={`rotate(-90, 6, ${H / 2})`}>Depth (m)</text>
+    </svg>
+  );
+}
+
+function DiveTimeline({ results, profileMode }) {
+  const { bottomTime, totalTime, turnaroundTime, decoSchedule } = results;
+  const { totalDecoTime } = decoSchedule;
+  const inbound = Math.round(turnaroundTime);
+  const outbound = Math.round(bottomTime - turnaroundTime);
+  const segments = [
+    { label: 'Inbound',  time: inbound,       color: 'var(--accent)' },
+    { label: 'Outbound', time: outbound,       color: '#4080f0' },
+    { label: 'Deco',     time: totalDecoTime,  color: 'var(--warn)' },
+  ].filter(s => s.time > 0);
+
+  return (
+    <div className="section">
+      <div className="section-title">Timeline</div>
+      {segments.map(s => (
+        <div key={s.label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7 }}>
+          <div style={{ width: 52, fontSize: 11, color: 'var(--muted)', flexShrink: 0 }}>{s.label}</div>
+          <div style={{ flex: 1, height: 7, background: 'var(--border)', borderRadius: 4, overflow: 'hidden' }}>
+            <div style={{ height: '100%', borderRadius: 4, background: s.color,
+              width: `${(s.time / totalTime) * 100}%` }} />
+          </div>
+          <div className="mono" style={{ fontSize: 12, minWidth: 44, textAlign: 'right' }}>{s.time} min</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ResultsPanel({ results, isLoading, profileMode }) {
   if (isLoading) {
     return <div className="empty"><div style={{ fontSize: 24 }}>⚙️</div>Calculating…</div>;
   }
@@ -1225,6 +1342,15 @@ function ResultsPanel({ results, isLoading }) {
         )}
       </div>
 
+      <div className="section">
+        <div className="section-title">Depth Profile</div>
+        <DepthTimeChart results={results} />
+      </div>
+
+      {profileMode === 'cave' && (
+        <DiveTimeline results={results} profileMode={profileMode} />
+      )}
+
       {results.diveLog && results.diveLog.length > 0 && (
         <div className="section">
           <div className="section-title">Tissue Loading at TD</div>
@@ -1271,6 +1397,79 @@ function MiniTissueBar({ log }) {
 // PERSISTENT SETTINGS
 // ═══════════════════════════════════════════════════════
 const STORAGE_KEY = 'cave-deco-settings-v1';
+const PROFILES_KEY = 'cave-deco-profiles-v1';
+
+function loadProfiles() {
+  try { return JSON.parse(localStorage.getItem(PROFILES_KEY)) || []; } catch { return []; }
+}
+function saveProfiles(profiles) {
+  try { localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles)); } catch {}
+}
+
+function SaveModal({ defaultName, onSave, onClose }) {
+  const [name, setName] = useState(defaultName || '');
+  return (
+    <div className="modal-overlay" onMouseDown={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 360 }} onMouseDown={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Save Profile</h2>
+          <button className="btn btn-sm" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <label>Profile name</label>
+          <input type="text" value={name} autoFocus placeholder="e.g. Wakulla 50m"
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && name.trim() && onSave(name.trim())} />
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!name.trim()} onClick={() => onSave(name.trim())}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoadModal({ onLoad, onClose }) {
+  const [profiles, setProfiles] = useState(loadProfiles);
+  const remove = (id) => {
+    const updated = profiles.filter(p => p.id !== id);
+    saveProfiles(updated);
+    setProfiles(updated);
+  };
+  return (
+    <div className="modal-overlay" onMouseDown={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 440 }} onMouseDown={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Load Profile</h2>
+          <button className="btn btn-sm" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body" style={{ padding: profiles.length === 0 ? '24px 20px' : '8px 12px' }}>
+          {profiles.length === 0 ? (
+            <div style={{ color: 'var(--muted)', fontSize: 13, textAlign: 'center' }}>No saved profiles yet.</div>
+          ) : profiles.map(p => (
+            <div key={p.id} style={{
+              display: 'flex', alignItems: 'center', gap: 10,
+              padding: '10px 8px', borderBottom: '1px solid var(--border)',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{p.name}</div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>
+                  {p.diveMode.toUpperCase()} · {p.profileMode === 'cave' ? 'Cave' : 'Time'} · {p.waypoints.length} waypoints · {new Date(p.savedAt).toLocaleDateString()}
+                </div>
+              </div>
+              <button className="btn btn-sm btn-primary" onClick={() => onLoad(p)}>Load</button>
+              <button className="btn btn-sm btn-danger" onClick={() => remove(p.id)}>✕</button>
+            </div>
+          ))}
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const DEFAULT_SETTINGS = {
   // Speeds
@@ -1430,6 +1629,9 @@ function App() {
   const [ascentRate, setAscentRate] = useState(_s.ascentRate);
   const [salt, setSalt] = useState(_s.salt);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSave, setShowSave] = useState(false);
+  const [showLoad, setShowLoad] = useState(false);
+  const [currentProfileName, setCurrentProfileName] = useState('');
   const [results, setResults] = useState(null);
   const [isCalculating, setIsCalculating] = useState(false);
 
@@ -1498,11 +1700,45 @@ function App() {
           <button className={`btn ${profileMode === 'time' ? 'btn-active' : ''}`} onClick={() => handleProfileMode('time')}>Time Profile</button>
         </div>
         <div className="header-spacer" />
+        <button className="btn" onClick={() => setShowLoad(true)}>📂 Load</button>
+        <button className="btn" onClick={() => setShowSave(true)}>💾 Save</button>
         <button className="btn" onClick={() => setShowSettings(true)} title="Settings" style={{ fontSize: 16 }}>⚙</button>
         <button className="btn btn-primary" onClick={handleCalculate} disabled={isCalculating}>
           {isCalculating ? '⚙ Calculating…' : '▶ Calculate'}
         </button>
       </header>
+      {showSave && (
+        <SaveModal
+          defaultName={currentProfileName}
+          onSave={name => {
+            const profile = { id: Date.now(), name, savedAt: Date.now(), diveMode, profileMode, waypoints, oc, ccr };
+            const existing = loadProfiles();
+            const idx = existing.findIndex(p => p.name === name);
+            const updated = idx >= 0
+              ? existing.map((p, i) => i === idx ? profile : p)
+              : [profile, ...existing];
+            saveProfiles(updated);
+            setCurrentProfileName(name);
+            setShowSave(false);
+          }}
+          onClose={() => setShowSave(false)}
+        />
+      )}
+      {showLoad && (
+        <LoadModal
+          onLoad={p => {
+            setDiveMode(p.diveMode);
+            setProfileMode(p.profileMode);
+            setWaypoints(p.waypoints);
+            setOc(p.oc);
+            setCcr(p.ccr);
+            setCurrentProfileName(p.name);
+            setResults(null);
+            setShowLoad(false);
+          }}
+          onClose={() => setShowLoad(false)}
+        />
+      )}
       {showSettings && (
         <SettingsModal
           settings={loadSettings()}
@@ -1579,7 +1815,7 @@ function App() {
         {/* RIGHT: Results */}
         <div className="panel">
           <div className="section-title" style={{ marginBottom: 8 }}>Results</div>
-          <ResultsPanel results={results} isLoading={isCalculating} />
+          <ResultsPanel results={results} isLoading={isCalculating} profileMode={profileMode} />
         </div>
       </div>
     </div>
