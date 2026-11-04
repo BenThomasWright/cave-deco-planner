@@ -276,7 +276,7 @@ function alveolarPP(gas, pamb, mode, setpoint, diluent) {
   const pamb_dry = pamb - P_H2O;
   if (mode === 'ccr') {
     const g = diluent || gas;
-    const ppO2 = Math.min(setpoint, Math.max((g.fO2 || 0) * pamb_dry, 0));
+    const ppO2 = Math.min(setpoint, pamb_dry);
     const pInert = Math.max(0, pamb_dry - ppO2);
     const gN2 = fN2of(g);
     const gHe = g.fHe || 0;

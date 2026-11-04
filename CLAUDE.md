@@ -30,7 +30,7 @@ The file is structured in clear sections (search for the `═══` comment div
 
 - **10-second time steps** for the bottom phase (fast enough for a browser, accurate enough for planning)
 - **GF line**: GF Low applied at the deepest ceiling (found using `gfLow` alone first), GF High at surface, linearly interpolated at intermediate depths
-- **CCR inert gas**: `ppO2 = min(setpoint, fO2_diluent * (P_amb - P_H2O))` — setpoint maintained unless too shallow; inert PP split by diluent N2:He ratio
+- **CCR inert gas**: `ppO2 = min(setpoint, P_amb - P_H2O)` — setpoint maintained by O2 solenoid at all depths; only drops below setpoint when ambient pressure itself is below the setpoint (~last 2m). Inert PP = `pamb_dry - ppO2`, split by diluent N2:He ratio.
 - **Cave profile mode**: waypoints are (distance, depth) with per-segment swim/scooter speed; optional mirror-return toggle (default on)
 - **Time profile mode**: waypoints are (time, depth) drawn directly — full profile, no mirroring
 - **Gas drops**: deco gases (OC) and bailout (CCR) each have a `dropDist` — distance from entrance where the bottle is left; picked up on the return leg
