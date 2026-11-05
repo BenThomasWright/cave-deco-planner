@@ -78,23 +78,51 @@ body {
 
 .main {
   display: grid;
-  grid-template-columns: 280px 1fr 300px;
+  grid-template-columns: var(--left-w, 280px) 6px 1fr 6px var(--right-w, 300px);
   grid-template-rows: 1fr;
   flex: 1;
   min-height: 0;
   gap: 0;
 }
 @media (max-width: 900px) {
-  .main { grid-template-columns: 1fr; grid-template-rows: auto auto auto; }
+  .main { display: flex; flex-direction: column; overflow-y: auto; }
+  .resize-handle { display: none; }
 }
 
 .panel {
-  border-right: 1px solid var(--border);
   overflow-y: auto;
   padding: 14px max(16px, env(safe-area-inset-left, 0px));
   padding-right: 14px;
+  border-right: none;
 }
-.panel:last-child { border-right: none; padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (max-width: 900px) {
+  .panel { border-bottom: 1px solid var(--border); overflow-y: visible; }
+  .panel:last-child { border-bottom: none; }
+}
+
+.resize-handle {
+  background: var(--border);
+  cursor: col-resize;
+  transition: background 0.15s;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+.resize-handle::after {
+  content: '';
+  display: block;
+  width: 2px;
+  height: 32px;
+  border-radius: 1px;
+  background: var(--muted);
+  opacity: 0.4;
+}
+.resize-handle:hover, .resize-handle:active {
+  background: color-mix(in srgb, var(--accent) 25%, var(--border));
+}
+.resize-handle:hover::after, .resize-handle:active::after { opacity: 0.9; }
 .panel-center { display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
 .panel-center .panel-scroll { overflow-y: auto; flex: 1; min-height: 0; padding: 14px; }
 
@@ -464,7 +492,7 @@ function buildDecoSchedule(tissues0, startDepth, decoGases, bottomGas, gfLow, gf
 
     const stopMinRounded = Math.ceil(stopMin);
     if (stopMinRounded > 0) {
-      stops.push({ depth: stopDepth, time: stopMinRounded, gas: gasName(gas) });
+      stops.push({ depth: stopDepth, time: stopMinRounded, gas: mode === 'ccr' ? 'Loop' : gasName(gas) });
     }
 
     // Ascend 3m to next stop
@@ -481,20 +509,25 @@ function buildDecoSchedule(tissues0, startDepth, decoGases, bottomGas, gfLow, gf
     stopDepth = nextDepth;
   }
 
-  return { stops, totalDecoTime: Math.ceil(totalTime), cns: Math.round(cns), noDecoNeeded: false };
+  const totalDecoTime = stops.reduce((s, st) => s + st.time, 0);
+  return { stops, totalDecoTime, cns: Math.round(cns), noDecoNeeded: false };
 }
 
 function runSimulation(config) {
   const { mode, diveMode, waypoints, profileMode, swimSpeed, scooterSpeed,
           bottomGas, decoGases, setpoint, diluent, bailoutGas,
           gfLow, gfHigh, salt, ascentRate, gasDrops,
-          bailoutAt, bailoutGasOC } = config;
+          bailoutAt, bailoutGasOC,
+          sacOC = 20, sacDeco = 15, sacBailout = 25, gasObjects = {} } = config;
 
   if (!waypoints || waypoints.length < 2) return null;
 
   const DT = 1 / 6; // 10-second steps
   let tissues = initTissues();
   let cns = 0;
+  const gasUsedL = {};
+  let bailoutTime = null;
+  let xTurnDist = 0; // cave mode turnaround distance from entrance
 
   // Build the time-depth path
   const path = []; // [{time, depth, dist, inbound}]
@@ -518,7 +551,6 @@ function runSimulation(config) {
       t += dx / spd;
       path.push({ time: t, depth: waypoints[i].y, dist: waypoints[i].x, inbound: true });
     }
-    // Return leg: mirror inbound if mirrorReturn, else waypoints already include return
     if (mirrorReturn) {
       for (let i = waypoints.length - 2; i >= 0; i--) {
         const dx = waypoints[i+1].x - waypoints[i].x;
@@ -526,64 +558,249 @@ function runSimulation(config) {
         t += dx / spd;
         path.push({ time: t, depth: waypoints[i].y, dist: waypoints[i].x, inbound: false });
       }
+    } else {
+      // Full explicit profile (always used via handleCalculate with mirrorReturn:false).
+      // Turnaround = middle waypoint by index — robust for Repeat Waypoints profiles.
+      // Path points keep their raw odometer as dist; no inbound/outbound transformation.
+      xTurnDist = waypoints[Math.floor((waypoints.length - 1) / 2)].x;
     }
-    // If not mirroring, user drew full profile — path ends at last waypoint
   }
 
-  // Interpolate path to DT steps and simulate tissues
-  const totalTime = path[path.length - 1].time;
-  let pIdx = 0;
-  const diveLog = []; // {time, depth, tissuesSnapshot}
-  let logInterval = 0;
-
-  for (let curT = 0; curT <= totalTime + DT * 0.5; curT += DT) {
-    // Interpolate depth at curT
-    while (pIdx < path.length - 2 && path[pIdx + 1].time <= curT) pIdx++;
-    const p1 = path[pIdx];
-    const p2 = path[Math.min(pIdx + 1, path.length - 1)];
-    const frac = p2.time > p1.time ? (curT - p1.time) / (p2.time - p1.time) : 0;
-    const depth = p1.depth + (p2.depth - p1.depth) * frac;
-    const dist  = p1.dist + (p2.dist - p1.dist) * frac;
-
-    // Determine if CCR diver has bailed out yet
-    // bailoutAt: distance (cave mode) or time (time mode) at which OC bailout begins
+  // ─── Shared per-step simulation helper ───────────────────────────────────
+  // Takes (depth, dist/odo, curT) and updates tissues/cns/gasUsedL/diveLog.
+  let lastStepGasName = diveMode === 'ccr' ? 'Loop' : gasName(bottomGas);
+  // gfLineParams is set in Phase 2 so simStep can log the GF ceiling.
+  let gfLineParams = null;
+  const simStep = (depth, dist, curT, isTravelStep) => {
     const hasBailedOut = diveMode === 'ccr' && bailoutAt != null && (
-      profileMode === 'cave' ? (!p1.inbound && dist <= bailoutAt + 1) : curT >= bailoutAt
+      profileMode === 'cave' ? (xTurnDist > 0 && dist >= 2 * xTurnDist - bailoutAt) : curT >= bailoutAt
     );
-
-    // Gas selection
     let activeGas = bottomGas;
     let effectiveMode = diveMode;
     if (hasBailedOut) {
       effectiveMode = 'oc';
       activeGas = bailoutGasOC || bottomGas;
+      const availBailout = decoGases.filter(g => !g.dropDist || (xTurnDist > 0 && dist >= 2 * xTurnDist - g.dropDist - 5));
+      const bestDeco = selectBestDecoGas(availBailout, depth, salt);
+      if (bestDeco) activeGas = bestDeco;
     } else if (diveMode === 'oc') {
       const availGases = decoGases.filter(g => {
         if (!g.dropDist) return true;
-        return (!p1.inbound && dist <= g.dropDist + 5);
+        return xTurnDist > 0 && dist >= 2 * xTurnDist - g.dropDist - 5;
       });
       const best = selectBestDecoGas([...availGases, bottomGas], depth, salt);
       if (best) activeGas = best;
     }
-
     const pamb = ambBar(depth, salt);
     const { ppN2, ppHe } = alveolarPP(activeGas, pamb, effectiveMode, setpoint, diluent);
     tissues = stepTissues(tissues, ppN2, ppHe, DT);
-
     const ppO2 = effectiveMode === 'ccr'
       ? Math.min(setpoint, pamb - P_H2O)
       : (pamb - P_H2O) * activeGas.fO2;
     cns += cnsRatePerMin(ppO2) * DT;
-
+    if (hasBailedOut && bailoutTime === null) bailoutTime = curT;
+    if (hasBailedOut) {
+      const name = gasName(activeGas);
+      const sac = isTravelStep ? sacBailout : sacDeco;
+      gasUsedL[name] = (gasUsedL[name] || 0) + sac * (pamb / SURFACE_P) * DT;
+    } else if (diveMode === 'oc') {
+      const sac = isTravelStep ? sacOC : sacDeco;
+      const name = isTravelStep ? gasName(bottomGas) : gasName(activeGas);
+      gasUsedL[name] = (gasUsedL[name] || 0) + sac * (pamb / SURFACE_P) * DT;
+    }
+    lastStepGasName = effectiveMode === 'ccr' ? 'Loop' : gasName(activeGas);
     logInterval += DT;
     if (logInterval >= 1 || curT === 0) {
-      diveLog.push({ time: curT, depth, dist, inbound: p1.inbound, cns: Math.round(cns) });
+      let ceiling = 0;
+      if (gfLineParams) {
+        const gf = Math.max(gfLineParams.gfLow, Math.min(gfLineParams.gfHigh,
+          gfAt(depth, gfLineParams.firstStop, gfLineParams.gfLow, gfLineParams.gfHigh)));
+        const cb = ceilingBar(tissues, gf);
+        ceiling = cb > SURFACE_P ? Math.max(0, barToM(cb, salt)) : 0;
+      }
+      diveLog.push({ time: curT, depth, dist, cns: Math.round(cns), ceiling });
       logInterval = 0;
     }
-  }
+  };
 
-  const exitDepth = path[path.length - 1].depth;
-  const bottomTimeMin = Math.round(totalTime);
+  const diveLog = [];
+  let logInterval = 0;
+  let exitDepth, bottomTimeMin;
+  let curT = 0;
+
+  let caveDecoStops = [];
+  let tissuesAtTurn = null, turnDepth = 0;
+
+  if (profileMode === 'cave' && xTurnDist > 0) {
+    // ═══ PHASE 1: INBOUND — simulate to turnaround ══════════════════════════
+    const turnPathIdx = Math.floor((path.length - 1) / 2);
+    const inboundTime = path[turnPathIdx].time;
+    let pIdx = 0;
+
+    for (curT = 0; curT <= inboundTime + DT * 0.5; curT += DT) {
+      while (pIdx < turnPathIdx && path[pIdx + 1].time <= curT) pIdx++;
+      const p1 = path[pIdx];
+      const p2 = path[Math.min(pIdx + 1, turnPathIdx)];
+      const frac = p2.time > p1.time ? (curT - p1.time) / (p2.time - p1.time) : 0;
+      simStep(
+        p1.depth + (p2.depth - p1.depth) * frac,
+        p1.dist  + (p2.dist  - p1.dist)  * frac,
+        curT, true
+      );
+    }
+
+    // ═══ PHASE 2: RETURN LEG — ceiling-constrained ascent inside cave ══════
+    // Snapshot tissues at turnaround — used for the algorithmic deco schedule.
+    tissuesAtTurn = cloneTissues(tissues);
+    turnDepth = path[turnPathIdx].depth;
+
+    // Anchor the GF line at the GF-low ceiling at turnaround tissues.
+    const gfLowFrac = gfLow / 100, gfHighFrac = gfHigh / 100;
+    const ceil0Bar = ceilingBar(tissues, gfLowFrac);
+    const firstStopDepth = ceil0Bar > SURFACE_P ? Math.max(0, barToM(ceil0Bar, salt)) : 0;
+    gfLineParams = { firstStop: firstStopDepth, gfLow: gfLowFrac, gfHigh: gfHighFrac };
+
+    // Build return-leg cave profile from path waypoints after the turnaround.
+    const returnWpts = path.slice(turnPathIdx);
+    const maxReturnOdo = returnWpts[returnWpts.length - 1].dist;
+
+    // Interpolate cave depth and speed from return waypoints.
+    const caveDepthAt = (odo) => {
+      for (let i = 0; i < returnWpts.length - 1; i++) {
+        if (returnWpts[i].dist <= odo && returnWpts[i + 1].dist >= odo) {
+          const f = (odo - returnWpts[i].dist) / (returnWpts[i + 1].dist - returnWpts[i].dist);
+          return returnWpts[i].depth + (returnWpts[i + 1].depth - returnWpts[i].depth) * f;
+        }
+      }
+      return returnWpts[returnWpts.length - 1].depth;
+    };
+    const caveSpeedAt = (odo) => {
+      for (let i = 0; i < returnWpts.length - 1; i++) {
+        if (returnWpts[i].dist <= odo && returnWpts[i + 1].dist > odo) {
+          const dt = returnWpts[i + 1].time - returnWpts[i].time;
+          const dx = returnWpts[i + 1].dist - returnWpts[i].dist;
+          return dt > 0 ? dx / dt : scooterSpeed;
+        }
+      }
+      const last = returnWpts[returnWpts.length - 1], prev = returnWpts[returnWpts.length - 2] || last;
+      const dt = last.time - prev.time, dx = last.dist - prev.dist;
+      return dt > 0 ? dx / dt : swimSpeed;
+    };
+
+    let returnOdo = xTurnDist;
+    let returnDepth = caveDepthAt(returnOdo);
+
+    // Loop: advance through cave or hold for deco; exit when at the surface.
+    // Safety guard: cap at ~6 hours of deco to prevent infinite loops from bugs.
+    const MAX_RETURN_STEPS = Math.ceil((6 * 60) / DT);
+    let returnSteps = 0;
+    let deepSectionSnapped = false; // tracks whether we've taken the end-of-deep-section snapshot
+
+    // Track in-cave deco holds to surface them in the results table.
+    let caveStopDepth = null, caveStopTime = 0, caveStopGas = null;
+
+    while ((returnOdo < maxReturnOdo || returnDepth > 0.1) && returnSteps++ < MAX_RETURN_STEPS) {
+      // Compute GF ceiling at next potential depth.
+      const speed = caveSpeedAt(returnOdo);
+      const newOdo = Math.min(returnOdo + speed * DT, maxReturnOdo);
+      const newCaveD = returnOdo < maxReturnOdo ? caveDepthAt(newOdo) : 0;
+
+      // Snapshot tissues at the end of the deep section — when the cave first starts
+      // ascending. This is the max-loading point for the deco schedule.
+      if (!deepSectionSnapped && returnOdo < maxReturnOdo && newCaveD < returnDepth - 0.5) {
+        tissuesAtTurn = cloneTissues(tissues);
+        turnDepth = returnDepth;
+        deepSectionSnapped = true;
+      }
+
+      // Check if advancing to newCaveD would violate the GF ceiling at that depth.
+      const gfNew = Math.max(gfLowFrac, Math.min(gfHighFrac,
+        gfAt(newCaveD, firstStopDepth, gfLowFrac, gfHighFrac)));
+      const ceilBarNew = ceilingBar(tissues, gfNew);
+      const ceilingAtNew = ceilBarNew > SURFACE_P ? Math.max(0, barToM(ceilBarNew, salt)) : 0;
+
+      let stepDepth, stepOdo, isTravelStep;
+      if (returnOdo >= maxReturnOdo) {
+        // Exited cave — open water ascent to surface constrained by ceiling.
+        const gfCur = Math.max(gfLowFrac, Math.min(gfHighFrac,
+          gfAt(returnDepth, firstStopDepth, gfLowFrac, gfHighFrac)));
+        const ceilCur = Math.max(0, barToM(ceilingBar(tissues, gfCur), salt));
+        stepDepth = Math.max(ceilCur, returnDepth - ascentRate * DT);
+        if (stepDepth < 0.1 && ceilCur < 0.1) { stepDepth = 0; }
+        stepOdo = maxReturnOdo;
+        isTravelStep = stepDepth < returnDepth - 0.05; // ascending = travel
+      } else if (newCaveD >= ceilingAtNew - 0.5) {
+        // Cave at the next odo is at or below the GF ceiling there — advance.
+        stepDepth = newCaveD;
+        stepOdo = newOdo;
+        isTravelStep = true;
+      } else {
+        // Cave would ascend past the ceiling — hold at current cave depth.
+        stepDepth = caveDepthAt(returnOdo);
+        stepOdo = returnOdo;
+        isTravelStep = false;
+      }
+
+      simStep(stepDepth, stepOdo, curT, isTravelStep);
+
+      // Accumulate in-cave deco holds (not open-water, not travel).
+      // Bucket to nearest 3m multiple so the table shows standard deco stop depths.
+      const holdingInCave = !isTravelStep && returnOdo < maxReturnOdo;
+      const roundedD = Math.round(stepDepth / 3) * 3;
+      if (holdingInCave) {
+        if (caveStopDepth !== roundedD) {
+          if (caveStopDepth !== null && caveStopTime > 0)
+            caveDecoStops.push({ depth: caveStopDepth, time: Math.ceil(caveStopTime), gas: caveStopGas, inCave: true });
+          caveStopDepth = roundedD; caveStopTime = 0; caveStopGas = lastStepGasName;
+        }
+        caveStopTime += DT;
+      } else if (caveStopDepth !== null) {
+        if (caveStopTime > 0)
+          caveDecoStops.push({ depth: caveStopDepth, time: Math.ceil(caveStopTime), gas: caveStopGas, inCave: true });
+        caveStopDepth = null; caveStopTime = 0;
+      }
+
+      returnOdo = stepOdo;
+      returnDepth = stepDepth;
+      curT += DT;
+      if (returnDepth <= 0) break;
+    }
+    // Flush any trailing in-cave stop.
+    if (caveStopDepth !== null && caveStopTime > 0)
+      caveDecoStops.push({ depth: caveStopDepth, time: Math.ceil(caveStopTime), gas: caveStopGas, inCave: true });
+
+    // Merge repeated stops at the same 3m-multiple depth into one entry.
+    const merged = [];
+    for (const s of caveDecoStops) {
+      const ex = merged.find(m => m.depth === s.depth);
+      if (ex) ex.time += s.time;
+      else merged.push({ ...s });
+    }
+    caveDecoStops = merged;
+
+    exitDepth = 0;
+    bottomTimeMin = Math.round(curT);
+
+  } else {
+    // ═══ TIME MODE (or mirrorReturn=true cave): original single loop ════════
+    const totalTime = path[path.length - 1].time;
+    let pIdx = 0;
+
+    for (curT = 0; curT <= totalTime + DT * 0.5; curT += DT) {
+      while (pIdx < path.length - 2 && path[pIdx + 1].time <= curT) pIdx++;
+      const p1 = path[pIdx];
+      const p2 = path[Math.min(pIdx + 1, path.length - 1)];
+      const frac = p2.time > p1.time ? (curT - p1.time) / (p2.time - p1.time) : 0;
+      simStep(
+        p1.depth + (p2.depth - p1.depth) * frac,
+        p1.dist  + (p2.dist  - p1.dist)  * frac,
+        curT, true
+      );
+    }
+
+    exitDepth = path[path.length - 1].depth;
+    bottomTimeMin = Math.round(totalTime);
+  }
 
   // After exit, deco mode: CCR if no bailout, or OC if bailed out
   const exitedAsCCR = diveMode === 'ccr' && bailoutAt == null;
@@ -593,26 +810,64 @@ function runSimulation(config) {
   const decoMode = exitedAsCCR ? 'ccr' : 'oc';
 
   const deco = buildDecoSchedule(
-    tissues, exitDepth, allDecoGases, bailoutGasOC || bottomGas,
+    tissuesAtTurn ?? tissues,
+    tissuesAtTurn ? turnDepth : exitDepth,
+    allDecoGases,
+    exitedAsCCR ? bottomGas : (bailoutGasOC || bottomGas),
     gfLow, gfHigh, salt, ascentRate, decoMode, setpoint, diluent
   );
+
+  // Deco stop gas consumption — only for time/profile mode.
+  // Cave mode tracks all gas (including deco holds) per-step in Phase 2; adding it again here would double-count.
+  if (profileMode !== 'cave') {
+    for (const stop of deco.stops) {
+      gasUsedL[stop.gas] = (gasUsedL[stop.gas] || 0) + sacDeco * (ambBar(stop.depth, salt) / SURFACE_P) * stop.time;
+    }
+  }
+
+  // Build per-gas consumption summary (requires gas size + fill pressure)
+  const gasConsumption = {};
+  for (const [name, gas] of Object.entries(gasObjects)) {
+    if (gas && (gas.size || 0) > 0) {
+      const fillPressure = gas.fillPressure || 200;
+      const size = gas.size;
+      const usedL = Math.round(gasUsedL[name] || 0);
+      const endBar = Math.round(fillPressure - usedL / size);
+      gasConsumption[name] = { usedL, endBar, startBar: fillPressure, sizeL: size };
+    }
+  }
 
   return {
     diveLog,
     decoSchedule: deco,
+    caveDecoStops,
     bottomTime: bottomTimeMin,
-    totalTime: bottomTimeMin + deco.totalDecoTime,
+    totalTime: profileMode === 'cave' ? bottomTimeMin : bottomTimeMin + deco.totalDecoTime,
     maxDepth: Math.max(...path.map(p => p.depth)),
     exitDepth,
     ascentRate,
-    turnaroundTime: profileMode === 'time' ? waypoints[waypoints.length - 1].x : path.find(p => !p.inbound)?.time || totalTime,
+    turnaroundTime: profileMode === 'time' ? waypoints[waypoints.length - 1].x : (path.find(p => p.dist >= xTurnDist)?.time ?? bottomTimeMin),
+    turnaroundDist: xTurnDist,
+    bailoutTime,
+    diveMode,
     cns: Math.round(cns + deco.cns),
+    gasConsumption,
   };
 }
 
 // ═══════════════════════════════════════════════════════
 // REACT COMPONENTS
 // ═══════════════════════════════════════════════════════
+
+function mergeStops(caveStops, owStops) {
+  const out = caveStops.map(s => ({ ...s }));
+  for (const s of owStops) {
+    const ex = out.find(m => m.depth === s.depth);
+    if (ex) ex.time += s.time;
+    else out.push({ ...s });
+  }
+  return out;
+}
 
 function NumInput({ label, value, onChange, min, max, step = 1, unit, width }) {
   return (
@@ -654,8 +909,13 @@ function GasEditor({ gas, onChange, onRemove, color, showSwitch, showDrop, profi
           onChange={v => updateField('fO2', Math.min(1, v/100))} />
         <NumInput label="He %" value={Math.round(gas.fHe*100)} min={0} max={99}
           onChange={v => updateField('fHe', Math.min(1-gas.fO2, v/100))} />
-        <NumInput label="Size L" value={gas.size || 12} min={1} max={50}
+        <NumInput label="Size L" value={gas.size || 12} min={1} max={40}
           onChange={v => updateField('size', v)} />
+        <NumInput label="Fill bar" value={gas.fillPressure || 200} min={50} max={400}
+          onChange={v => updateField('fillPressure', v)} />
+        <div style={{ fontSize: 10, color: 'var(--muted)', gridColumn: '1 / -1', marginTop: -6 }}>
+          Capacity: {((gas.size || 12) * (gas.fillPressure || 200)).toLocaleString()}L
+        </div>
       </div>
       {showSwitch && (
         <div className="field-row" style={{ marginTop: 6 }}>
@@ -679,7 +939,7 @@ function CCRPanel({ ccr, onChange, profileMode }) {
 
   const addDecoBailout = () => onChange({
     ...ccr,
-    decoBailouts: [...(ccr.decoBailouts || []), { fO2: 0.5, fHe: 0, size: 3, switchDepth: 21, dropDist: 0 }]
+    decoBailouts: [...(ccr.decoBailouts || []), { fO2: 0.5, fHe: 0, size: 3, fillPressure: 200, switchDepth: 21, dropDist: 0 }]
   });
   const updateDecoBailout = (i, g) => {
     const d = [...(ccr.decoBailouts || [])]; d[i] = g;
@@ -1142,13 +1402,14 @@ function WaypointsTable({ waypoints, onChange, profileMode }) {
 // RESULTS PANEL
 // ═══════════════════════════════════════════════════════
 
-function DepthTimeChart({ results }) {
-  const { diveLog, decoSchedule, bottomTime, totalTime, maxDepth, exitDepth, ascentRate, turnaroundTime } = results;
-  const { stops } = decoSchedule;
+function DepthTimeChart({ results, fullWidth = false }) {
+  const { diveLog, decoSchedule, caveDecoStops = [], bottomTime, totalTime, maxDepth, exitDepth, ascentRate, turnaroundTime, bailoutTime, diveMode } = results;
+  const { stops: owStops } = decoSchedule;
+  const stops = [...caveDecoStops, ...owStops];
   if (!diveLog || diveLog.length === 0) return null;
 
-  const W = 260, H = 130;
-  const PAD = { top: 8, right: 8, bottom: 22, left: 30 };
+  const W = fullWidth ? 500 : 260, H = fullWidth ? 200 : 130;
+  const PAD = { top: 10, right: 10, bottom: 24, left: 32 };
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
   const yMax = Math.ceil((maxDepth * 1.1) / 10) * 10 || 10;
@@ -1156,60 +1417,176 @@ function DepthTimeChart({ results }) {
   const sx = t => PAD.left + (t / totalTime) * cW;
   const sy = d => PAD.top + (d / yMax) * cH;
 
-  // Bottom phase path
-  const logD = diveLog.map((p, i) =>
+  // Split diveLog at bailout point for CCR/OC colouring
+  const hasBailout = diveMode === 'ccr' && bailoutTime != null;
+
+  // Deco/ascent phase
+  const ar = ascentRate || 9;
+  const ed = exitDepth ?? diveLog[diveLog.length - 1]?.depth ?? 0;
+
+  // If the cave exit ascent went past the first stop (e.g. cave entrance is at the surface),
+  // find the last logged point where the diver was at or below the first stop depth and clip there.
+  // This makes the deco line join seamlessly instead of drawing backwards.
+  let decoJoinT = bottomTime, decoJoinD = ed;
+  if (owStops.length > 0 && ed < owStops[0].depth - 1) {
+    const firstStop = owStops[0].depth;
+    for (let i = diveLog.length - 1; i >= 0; i--) {
+      if (diveLog[i].depth >= firstStop - 1) {
+        decoJoinT = diveLog[i].time;
+        decoJoinD = firstStop;
+        break;
+      }
+    }
+  }
+
+  // For cave dives (ceiling line present), show full diveLog; for OC/time dives clip at decoJoinT.
+  const haveCeiling = diveLog.some(p => p.ceiling > 0.1);
+  const pathBefore = [], pathAfter = [];
+  for (const p of diveLog) {
+    if (!haveCeiling && p.time > decoJoinT) continue;
+    if (!hasBailout || p.time <= bailoutTime) pathBefore.push(p);
+    else pathAfter.push(p);
+  }
+  if (hasBailout && pathAfter.length > 0) {
+    // Add the last CCR point to the start of the OC path for continuity
+    const last = pathBefore[pathBefore.length - 1];
+    if (last) pathAfter.unshift(last);
+  }
+
+  const toPath = pts => pts.map((p, i) =>
     `${i === 0 ? 'M' : 'L'}${sx(p.time).toFixed(1)},${sy(p.depth).toFixed(1)}`
   ).join(' ');
 
-  // Deco/ascent phase path
-  const ar = ascentRate || 9;
-  const ed = exitDepth ?? diveLog[diveLog.length - 1]?.depth ?? 0;
-  let decoD = `M${sx(bottomTime).toFixed(1)},${sy(ed).toFixed(1)}`;
-  let t = bottomTime, d = ed;
-  if (stops.length > 0) {
-    t += (d - stops[0].depth) / ar; d = stops[0].depth;
-    decoD += ` L${sx(t).toFixed(1)},${sy(d).toFixed(1)}`;
-    for (let i = 0; i < stops.length; i++) {
-      t += stops[i].time; decoD += ` L${sx(t).toFixed(1)},${sy(stops[i].depth).toFixed(1)}`;
-      const nd = i < stops.length - 1 ? stops[i + 1].depth : 0;
-      t += (stops[i].depth - nd) / ar; d = nd;
+  const logD = toPath(pathBefore);
+  const ocD = hasBailout ? toPath(pathAfter) : '';
+
+  let t = decoJoinT, d = decoJoinD;
+  // Open-water deco staircase (only remaining OW stops, not cave stops).
+  let decoD = '';
+  if (owStops.length > 0) {
+    const firstStop = owStops[0].depth;
+    decoD = `M${sx(t).toFixed(1)},${sy(d).toFixed(1)}`;
+    if (Math.abs(d - firstStop) > 0.5) {
+      t += Math.abs(d - firstStop) / ar; d = firstStop;
       decoD += ` L${sx(t).toFixed(1)},${sy(d).toFixed(1)}`;
     }
-  } else {
-    t += d / ar;
+    for (let i = 0; i < owStops.length; i++) {
+      t += owStops[i].time; decoD += ` L${sx(t).toFixed(1)},${sy(owStops[i].depth).toFixed(1)}`;
+      const nd = i < owStops.length - 1 ? owStops[i + 1].depth : 0;
+      t += (owStops[i].depth - nd) / ar; d = nd;
+      decoD += ` L${sx(t).toFixed(1)},${sy(d).toFixed(1)}`;
+    }
+  } else if (ed > 0 && caveDecoStops.length === 0) {
+    decoD = `M${sx(t).toFixed(1)},${sy(ed).toFixed(1)}`;
+    t += ed / ar;
     decoD += ` L${sx(t).toFixed(1)},${sy(0).toFixed(1)}`;
   }
+
+  // Red GF ceiling line during the return leg (from diveLog ceiling values).
+  const ceilPts = diveLog.filter(p => p.time > turnaroundTime && p.ceiling > 0.1);
+  const ceilD = ceilPts.length > 1 ? ceilPts.map((p, i) =>
+    `${i === 0 ? 'M' : 'L'}${sx(p.time).toFixed(1)},${sy(p.ceiling).toFixed(1)}`
+  ).join(' ') : '';
 
   const depthStep = yMax <= 20 ? 5 : yMax <= 50 ? 10 : yMax <= 100 ? 20 : 30;
   const timeStep = totalTime <= 30 ? 5 : totalTime <= 90 ? 15 : totalTime <= 180 ? 30 : 60;
 
   return (
     <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
-      {/* Depth grid */}
       {Array.from({ length: Math.floor(yMax / depthStep) + 1 }, (_, i) => i * depthStep).map(dep => (
         <g key={dep}>
           <line x1={PAD.left} y1={sy(dep)} x2={W - PAD.right} y2={sy(dep)} stroke="var(--border)" strokeWidth="0.5" />
           <text x={PAD.left - 3} y={sy(dep) + 3} textAnchor="end" fontSize="8" fill="var(--muted)">{dep}</text>
         </g>
       ))}
-      {/* Time grid */}
       {Array.from({ length: Math.floor(totalTime / timeStep) + 1 }, (_, i) => i * timeStep).map(ti => (
         <g key={ti}>
           <line x1={sx(ti)} y1={PAD.top} x2={sx(ti)} y2={H - PAD.bottom} stroke="var(--border)" strokeWidth="0.5" />
           <text x={sx(ti)} y={H - PAD.bottom + 10} textAnchor="middle" fontSize="8" fill="var(--muted)">{ti}</text>
         </g>
       ))}
-      {/* Turnaround marker */}
-      {turnaroundTime > 0 && turnaroundTime < bottomTime && (
-        <line x1={sx(turnaroundTime)} y1={PAD.top} x2={sx(turnaroundTime)} y2={H - PAD.bottom}
-          stroke="var(--accent)" strokeWidth="1" strokeDasharray="3,2" opacity="0.5" />
+      {/* CCR (or full OC) bottom phase */}
+      {logD && <path d={logD} fill="none" stroke="var(--accent)" strokeWidth="1.5" />}
+      {/* OC bailout phase */}
+      {ocD && <path d={ocD} fill="none" stroke="#f0a030" strokeWidth="1.5" />}
+      {/* GF ceiling during return (red) */}
+      {ceilD && <path d={ceilD} fill="none" stroke="rgba(220,60,60,0.65)" strokeWidth="1" strokeDasharray="3,2" />}
+      {/* Remaining open-water deco staircase (green) — only for non-cave dives */}
+      {!haveCeiling && decoD && <path d={decoD} fill="none" stroke="var(--success)" strokeWidth="1.5" strokeDasharray="4,2" />}
+      <text x={W / 2} y={H - 4} textAnchor="middle" fontSize="8" fill="var(--muted)">Time (min)</text>
+      <text x={6} y={H / 2} textAnchor="middle" fontSize="8" fill="var(--muted)"
+        transform={`rotate(-90, 6, ${H / 2})`}>Depth (m)</text>
+      {hasBailout && (
+        <g>
+          <rect x={PAD.left + 2} y={PAD.top + 2} width={42} height={22} rx="2" fill="var(--surface)" opacity="0.85" />
+          <line x1={PAD.left + 6} y1={PAD.top + 10} x2={PAD.left + 16} y2={PAD.top + 10} stroke="var(--accent)" strokeWidth="2" />
+          <text x={PAD.left + 19} y={PAD.top + 13} fontSize="7" fill="var(--muted)">CCR</text>
+          <line x1={PAD.left + 6} y1={PAD.top + 20} x2={PAD.left + 16} y2={PAD.top + 20} stroke="#f0a030" strokeWidth="2" />
+          <text x={PAD.left + 19} y={PAD.top + 23} fontSize="7" fill="var(--muted)">OC</text>
+        </g>
       )}
-      {/* Bottom phase */}
-      <path d={logD} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
-      {/* Deco/ascent phase */}
-      <path d={decoD} fill="none" stroke="var(--success)" strokeWidth="1.5" strokeDasharray="4,2" />
-      {/* Axis label */}
-      <text x={W / 2} y={H - 3} textAnchor="middle" fontSize="8" fill="var(--muted)">Time (min)</text>
+    </svg>
+  );
+}
+
+function DepthDistChart({ results, fullWidth = false }) {
+  const { diveLog, maxDepth, bailoutTime, diveMode, turnaroundDist } = results;
+  if (!diveLog || diveLog.length === 0) return null;
+  const pts = diveLog.filter(p => p.dist != null);
+  if (!pts.length) return null;
+
+  // dist is raw odometer (0 → 2*xTurnDist for a symmetric out-and-back cave).
+  // No conversion needed — just use p.dist directly.
+
+  const W = fullWidth ? 500 : 260, H = fullWidth ? 200 : 130;
+  const PAD = { top: 10, right: 10, bottom: 24, left: 32 };
+  const cW = W - PAD.left - PAD.right;
+  const cH = H - PAD.top - PAD.bottom;
+  const yMax = Math.ceil((maxDepth * 1.1) / 10) * 10 || 10;
+  const xMax = Math.max(...pts.map(p => p.dist)) || 1;
+
+  const sx = x => PAD.left + (x / xMax) * cW;
+  const sy = d => PAD.top + (d / yMax) * cH;
+
+  const hasBailout = diveMode === 'ccr' && bailoutTime != null;
+
+  // Split at bailout time for CCR/OC colouring
+  const before = [], after = [];
+  for (const p of pts) {
+    if (!hasBailout || p.time <= bailoutTime) before.push(p);
+    else after.push(p);
+  }
+  if (hasBailout && after.length > 0) {
+    const last = before[before.length - 1];
+    if (last) after.unshift(last);
+  }
+
+  const toPath = ps => ps.map((p, i) =>
+    `${i === 0 ? 'M' : 'L'}${sx(p.dist).toFixed(1)},${sy(p.depth).toFixed(1)}`
+  ).join(' ');
+
+  const depthStep = yMax <= 20 ? 5 : yMax <= 50 ? 10 : yMax <= 100 ? 20 : 30;
+  const distStep = xMax <= 500 ? 100 : xMax <= 2000 ? 500 : 1000;
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: 'block' }}>
+      {Array.from({ length: Math.floor(yMax / depthStep) + 1 }, (_, i) => i * depthStep).map(dep => (
+        <g key={dep}>
+          <line x1={PAD.left} y1={sy(dep)} x2={W - PAD.right} y2={sy(dep)} stroke="var(--border)" strokeWidth="0.5" />
+          <text x={PAD.left - 3} y={sy(dep) + 3} textAnchor="end" fontSize="8" fill="var(--muted)">{dep}</text>
+        </g>
+      ))}
+      {Array.from({ length: Math.floor(xMax / distStep) + 1 }, (_, i) => i * distStep).map(x => (
+        <g key={x}>
+          <line x1={sx(x)} y1={PAD.top} x2={sx(x)} y2={H - PAD.bottom} stroke="var(--border)" strokeWidth="0.5" />
+          <text x={sx(x)} y={H - PAD.bottom + 10} textAnchor="middle" fontSize="8" fill="var(--muted)">{x}</text>
+        </g>
+      ))}
+      <path d={toPath(before)} fill="none" stroke="var(--accent)" strokeWidth="1.5" />
+      {hasBailout && after.length > 1 && (
+        <path d={toPath(after)} fill="none" stroke="#f0a030" strokeWidth="1.5" />
+      )}
+      <text x={W / 2} y={H - 4} textAnchor="middle" fontSize="8" fill="var(--muted)">Distance (m)</text>
       <text x={6} y={H / 2} textAnchor="middle" fontSize="8" fill="var(--muted)"
         transform={`rotate(-90, 6, ${H / 2})`}>Depth (m)</text>
     </svg>
@@ -1219,12 +1596,13 @@ function DepthTimeChart({ results }) {
 function DiveTimeline({ results, profileMode }) {
   const { bottomTime, totalTime, turnaroundTime, decoSchedule } = results;
   const { totalDecoTime } = decoSchedule;
+  const totalAllDecoTime = totalDecoTime;
   const inbound = Math.round(turnaroundTime);
   const outbound = Math.round(bottomTime - turnaroundTime);
   const segments = [
-    { label: 'Inbound',  time: inbound,       color: 'var(--accent)' },
-    { label: 'Outbound', time: outbound,       color: '#4080f0' },
-    { label: 'Deco',     time: totalDecoTime,  color: 'var(--warn)' },
+    { label: 'Inbound',  time: inbound,            color: 'var(--accent)' },
+    { label: 'Outbound', time: outbound,            color: '#4080f0' },
+    { label: 'Deco',     time: totalAllDecoTime,    color: 'var(--warn)' },
   ].filter(s => s.time > 0);
 
   return (
@@ -1261,7 +1639,9 @@ function ResultsPanel({ results, isLoading, profileMode }) {
   }
 
   const { decoSchedule, bottomTime, totalTime, maxDepth, cns } = results;
-  const { stops, totalDecoTime, noDecoNeeded } = decoSchedule;
+  const { stops: owStops, totalDecoTime, noDecoNeeded } = decoSchedule;
+  const stops = owStops;
+  const totalAllDecoTime = totalDecoTime;
   const maxStopTime = stops.length > 0 ? Math.max(...stops.map(s => s.time)) : 1;
 
   const stopColor = (depth) => {
@@ -1277,25 +1657,21 @@ function ResultsPanel({ results, isLoading, profileMode }) {
 
   return (
     <div>
-      <div className="stats-grid">
+      <div className="stats-grid" style={{ gridTemplateColumns: '1fr 1fr 1fr' }}>
         <div className="stat-tile">
           <div className="stat-value mono">{Math.round(maxDepth)}<span className="stat-unit">m</span></div>
           <div className="stat-label">Max Depth</div>
         </div>
         <div className="stat-tile">
-          <div className="stat-value mono">{bottomTime}<span className="stat-unit">min</span></div>
-          <div className="stat-label">Bottom Time</div>
+          <div className="stat-value mono">{totalTime}<span className="stat-unit">min</span></div>
+          <div className="stat-label">Dive Time</div>
         </div>
         <div className="stat-tile">
           <div className="stat-value mono" style={{ color: noDecoNeeded ? 'var(--success)' : 'var(--warn)' }}>
-            {noDecoNeeded ? 'NDL' : `${totalDecoTime}`}
+            {noDecoNeeded ? 'NDL' : `${totalAllDecoTime}`}
             {!noDecoNeeded && <span className="stat-unit">min</span>}
           </div>
           <div className="stat-label">Total Deco</div>
-        </div>
-        <div className="stat-tile">
-          <div className="stat-value mono">{totalTime}<span className="stat-unit">min</span></div>
-          <div className="stat-label">Runtime</div>
         </div>
       </div>
 
@@ -1322,7 +1698,9 @@ function ResultsPanel({ results, isLoading, profileMode }) {
           <div>
             {stops.map((stop, i) => (
               <div key={i} className="stop-row">
-                <div className="stop-depth" style={{ color: stopColor(stop.depth) }}>{stop.depth}m</div>
+                <div className="stop-depth" style={{ color: stopColor(stop.depth) }}>
+                  {stop.depth}m
+                </div>
                 <div className="stop-bar" style={{
                   background: stopColor(stop.depth),
                   width: `${Math.max(4, (stop.time / maxStopTime) * 100)}px`,
@@ -1336,11 +1714,49 @@ function ResultsPanel({ results, isLoading, profileMode }) {
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 8,
               display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
               <span style={{ color: 'var(--muted)' }}>Total deco</span>
-              <span className="mono" style={{ fontWeight: 600 }}>{totalDecoTime} min</span>
+              <span className="mono" style={{ fontWeight: 600 }}>
+                {caveStops.reduce((s, x) => s + x.time, 0) + totalDecoTime} min
+              </span>
             </div>
           </div>
         )}
       </div>
+
+      {results.gasConsumption && Object.keys(results.gasConsumption).length > 0 && (
+        <div className="section">
+          <div className="section-title">Gas Consumption</div>
+          {Object.entries(results.gasConsumption).map(([name, info]) => {
+            const low = info.endBar < 50;
+            const warn = info.endBar < 100;
+            const barColor = low ? 'var(--danger)' : warn ? 'var(--warn)' : 'var(--success)';
+            const pct = Math.max(0, Math.min(100, (info.endBar / info.startBar) * 100));
+            return (
+              <div key={name} style={{ marginBottom: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>{name}</span>
+                  <span className="mono" style={{ fontSize: 13, color: barColor }}>
+                    {info.endBar < 0 ? '⚠ EMPTY' : `${info.endBar} bar`}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ flex: 1, height: 6, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', borderRadius: 3, background: barColor,
+                      width: `${pct}%`, transition: 'width 0.3s' }} />
+                  </div>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', minWidth: 100, textAlign: 'right' }}>
+                    {info.usedL}L of {info.startBar * info.sizeL}L ({info.sizeL}L@{info.startBar}bar)
+                  </span>
+                </div>
+                {low && (
+                  <div style={{ fontSize: 11, color: 'var(--danger)', marginTop: 3 }}>
+                    ⚠ Below 50 bar reserve — insufficient gas
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <div className="section">
         <div className="section-title">Depth Profile</div>
@@ -1385,6 +1801,118 @@ function MiniTissueBar({ log }) {
         {[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16].map(n => (
           <div key={n} style={{ textAlign: 'center', fontSize: 9 }}>{n}</div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function ResultsView({ results, profileMode, isCalculating, onBack }) {
+  if (!results) return null;
+  const { decoSchedule, maxDepth, bottomTime, totalTime, cns, gasConsumption } = results;
+  const { stops: owStops, totalDecoTime, noDecoNeeded } = decoSchedule;
+  const stops = owStops;
+  const totalAllDecoTime = totalDecoTime;
+  const cnsColor = cns >= 80 ? 'var(--danger)' : cns >= 50 ? 'var(--warn)' : 'var(--success)';
+  const maxStopTime = Math.max(1, ...stops.map(s => s.time));
+  const stopColor = d => d <= 6 ? 'var(--success)' : d <= 12 ? 'var(--accent)' : 'var(--warn)';
+
+  return (
+    <div style={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+      {/* LEFT: compact stats + deco + gas */}
+      <div className="panel" style={{ width: 280, flexShrink: 0, overflowY: 'auto', borderRight: '1px solid var(--border)' }}>
+        <div className="section">
+          <div className="section-title">Summary</div>
+          <div className="stats-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            {[
+              { label: 'Max Depth', value: `${maxDepth}m` },
+              { label: 'Dive Time', value: `${Math.round(totalTime)}min` },
+              { label: 'Total Deco', value: `${totalAllDecoTime}min` },
+            ].map(s => (
+              <div key={s.label} style={{ background: 'var(--surface)', borderRadius: 6, padding: '8px 10px' }}>
+                <div className="mono" style={{ fontSize: 20, fontWeight: 700 }}>{s.value}</div>
+                <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 1 }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+              <span style={{ color: 'var(--muted)' }}>CNS O₂</span>
+              <span className="mono" style={{ color: cnsColor }}>{cns}%</span>
+            </div>
+            <div style={{ height: 6, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ height: '100%', borderRadius: 3, background: cnsColor, width: `${Math.min(100, cns)}%` }} />
+            </div>
+          </div>
+        </div>
+
+        <div className="section">
+          <div className="section-title">Deco Schedule</div>
+          {noDecoNeeded ? (
+            <div style={{ color: 'var(--success)', fontWeight: 600, padding: '6px 0', fontSize: 13 }}>✓ No Deco Required</div>
+          ) : stops.map((stop, i) => (
+            <div key={i} className="stop-row">
+              <div className="stop-depth" style={{ color: stopColor(stop.depth) }}>
+                {stop.depth}m
+              </div>
+              <div className="stop-bar" style={{ background: stopColor(stop.depth), width: `${Math.max(4, (stop.time / maxStopTime) * 100)}px`, maxWidth: 100, opacity: 0.8 }} />
+              <div className="stop-time mono">{stop.time} min</div>
+              <div className="stop-gas">{stop.gas}</div>
+            </div>
+          ))}
+          <div style={{ borderTop: '1px solid var(--border)', marginTop: 6, paddingTop: 6, display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+            <span style={{ color: 'var(--muted)' }}>Total deco</span>
+            <span className="mono" style={{ fontWeight: 600 }}>{totalDecoTime} min</span>
+          </div>
+        </div>
+
+        {gasConsumption && Object.keys(gasConsumption).length > 0 && (
+          <div className="section">
+            <div className="section-title">Gas Consumption</div>
+            {Object.entries(gasConsumption).map(([name, info]) => {
+              const low = info.endBar < 50, warn = info.endBar < 100;
+              const col = low ? 'var(--danger)' : warn ? 'var(--warn)' : 'var(--success)';
+              const pct = Math.max(0, Math.min(100, (info.endBar / info.startBar) * 100));
+              return (
+                <div key={name} style={{ marginBottom: 10 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                    <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{name}</span>
+                    <span className="mono" style={{ fontSize: 12, color: col }}>{info.endBar < 0 ? '⚠ EMPTY' : `${info.endBar} bar`}</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div style={{ flex: 1, height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', borderRadius: 3, background: col, width: `${pct}%` }} />
+                    </div>
+                    <span style={{ fontSize: 10, color: 'var(--muted)', minWidth: 90, textAlign: 'right' }}>
+                      {info.usedL}L of {info.startBar * info.sizeL}L
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <DiveTimeline results={results} profileMode={profileMode} />
+        {results.diveLog?.length > 0 && (
+          <div className="section">
+            <div className="section-title">Tissue Loading at TD</div>
+            <MiniTissueBar log={results.diveLog} />
+          </div>
+        )}
+      </div>
+
+      {/* RIGHT: big charts */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+        <div>
+          <div className="section-title" style={{ marginBottom: 8 }}>Depth Profile — Time</div>
+          <DepthTimeChart results={results} fullWidth={true} />
+        </div>
+        {profileMode === 'cave' && (
+          <div>
+            <div className="section-title" style={{ marginBottom: 8 }}>Depth Profile — Distance from Entrance</div>
+            <DepthDistChart results={results} fullWidth={true} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1437,6 +1965,36 @@ function LoadModal({ onLoad, onClose }) {
     saveProfiles(updated);
     setProfiles(updated);
   };
+  const exportAll = async () => {
+    const json = JSON.stringify(profiles, null, 2);
+    const downloads = window.claude ? await window.claude.use('downloads') : null;
+    if (downloads) {
+      await downloads.save({ filename: 'cave-deco-profiles.json', data: json });
+    } else {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+      a.download = 'cave-deco-profiles.json';
+      a.click();
+    }
+  };
+  const importFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const imported = JSON.parse(ev.target.result);
+        if (!Array.isArray(imported)) return;
+        const existing = loadProfiles();
+        const existingIds = new Set(existing.map(p => p.id));
+        const merged = [...existing, ...imported.filter(p => !existingIds.has(p.id))];
+        saveProfiles(merged);
+        setProfiles(merged);
+      } catch {}
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
   return (
     <div className="modal-overlay" onMouseDown={onClose}>
       <div className="modal-panel" style={{ maxWidth: 440 }} onMouseDown={e => e.stopPropagation()}>
@@ -1463,7 +2021,13 @@ function LoadModal({ onLoad, onClose }) {
             </div>
           ))}
         </div>
-        <div className="modal-footer">
+        <div className="modal-footer" style={{ gap: 8 }}>
+          <button className="btn" onClick={exportAll} disabled={profiles.length === 0}
+            title="Download all profiles as a JSON file">Export</button>
+          <label className="btn" style={{ cursor: 'pointer' }} title="Import profiles from a JSON file">
+            Import
+            <input type="file" accept=".json" style={{ display: 'none' }} onChange={importFile} />
+          </label>
           <button className="btn" onClick={onClose}>Close</button>
         </div>
       </div>
@@ -1588,17 +2152,17 @@ function SettingsModal({ settings, onSave, onClose }) {
 }
 
 const DEFAULT_OC = {
-  bottomGas: { fO2: 0.21, fHe: 0, size: 12 },
-  decoGases: [{ fO2: 0.5, fHe: 0, size: 3, switchDepth: 21, dropDist: 0 }],
+  bottomGas: { fO2: 0.21, fHe: 0, size: 12, fillPressure: 200 },
+  decoGases: [{ fO2: 0.5, fHe: 0, size: 3, switchDepth: 21, dropDist: 0, fillPressure: 200 }],
 };
 
 const DEFAULT_CCR = {
   setpoint: 1.3,
   decoSetpoint: 1.3,
-  diluent: { fO2: 0.21, fHe: 0, size: 3 },
-  bailout: { fO2: 0.21, fHe: 0, size: 7, dropDist: 0 },
+  diluent: { fO2: 0.21, fHe: 0, size: 3, fillPressure: 200 },
+  bailout: { fO2: 0.21, fHe: 0, size: 7, dropDist: 0, fillPressure: 200 },
   bailoutAt: '',
-  decoBailouts: [{ fO2: 0.5, fHe: 0, size: 3, switchDepth: 21, dropDist: 0 }],
+  decoBailouts: [{ fO2: 0.5, fHe: 0, size: 3, switchDepth: 21, dropDist: 0, fillPressure: 200 }],
 };
 
 const DEFAULT_WAYPOINTS_CAVE = [
@@ -1634,6 +2198,11 @@ function App() {
   const [currentProfileName, setCurrentProfileName] = useState('');
   const [results, setResults] = useState(null);
   const [isCalculating, setIsCalculating] = useState(false);
+  const [viewMode, setViewMode] = useState('plan'); // 'plan' | 'results'
+  const [panelWidths, setPanelWidths] = useState(() => {
+    try { const s = JSON.parse(localStorage.getItem('deco-panel-widths') || '{}'); return { left: s.left || 280, right: s.right || 300 }; }
+    catch { return { left: 280, right: 300 }; }
+  });
 
   // Switch profile mode
   const handleProfileMode = (m) => {
@@ -1652,6 +2221,17 @@ function App() {
         const gasDrops = diveMode === 'oc'
           ? oc.decoGases.map(g => ({ dist: g.dropDist }))
           : [{ dist: ccr.bailout.dropDist }];
+
+        const s = loadSettings();
+        // Build gasObjects map (gasName -> gas object) for consumption tracking
+        const gasObjects = {};
+        if (diveMode === 'oc') {
+          gasObjects[gasName(oc.bottomGas)] = oc.bottomGas;
+          oc.decoGases.forEach(g => { gasObjects[gasName(g)] = g; });
+        } else {
+          gasObjects[gasName(ccr.bailout)] = ccr.bailout;
+          (ccr.decoBailouts || []).forEach(g => { gasObjects[gasName(g)] = g; });
+        }
 
         const res = runSimulation({
           diveMode,
@@ -1672,8 +2252,13 @@ function App() {
           ascentRate,
           gasDrops,
           mirrorReturn: false,
+          sacOC: s.sacOC,
+          sacDeco: s.sacDeco,
+          sacBailout: s.sacBailout,
+          gasObjects,
         });
         setResults(res);
+        if (res) setViewMode('results');
       } catch (e) {
         console.error('Simulation error:', e);
         setResults(null);
@@ -1686,6 +2271,24 @@ function App() {
   const gasDrops = diveMode === 'oc'
     ? oc.decoGases.map(g => ({ dist: g.dropDist, name: gasName(g) }))
     : [{ dist: ccr.bailout.dropDist, name: 'Bailout' }];
+
+  function startPanelDrag(side, e) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelWidths[side];
+    const onMove = (ev) => {
+      const delta = ev.clientX - startX;
+      const next = Math.max(220, Math.min(520, side === 'left' ? startW + delta : startW - delta));
+      setPanelWidths(w => {
+        const updated = { ...w, [side]: next };
+        try { localStorage.setItem('deco-panel-widths', JSON.stringify(updated)); } catch {}
+        return updated;
+      });
+    };
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
 
   return (
     <div className="app">
@@ -1700,6 +2303,12 @@ function App() {
           <button className={`btn ${profileMode === 'time' ? 'btn-active' : ''}`} onClick={() => handleProfileMode('time')}>Time Profile</button>
         </div>
         <div className="header-spacer" />
+        {results && (
+          <div className="seg-group">
+            <button className={`btn ${viewMode === 'plan' ? 'btn-active' : ''}`} onClick={() => setViewMode('plan')}>Plan</button>
+            <button className={`btn ${viewMode === 'results' ? 'btn-active' : ''}`} onClick={() => setViewMode('results')}>Results</button>
+          </div>
+        )}
         <button className="btn" onClick={() => setShowLoad(true)}>📂 Load</button>
         <button className="btn" onClick={() => setShowSave(true)}>💾 Save</button>
         <button className="btn" onClick={() => setShowSettings(true)} title="Settings" style={{ fontSize: 16 }}>⚙</button>
@@ -1753,7 +2362,10 @@ function App() {
         />
       )}
 
-      <div className="main">
+      {viewMode === 'results' && results ? (
+        <ResultsView results={results} profileMode={profileMode} isCalculating={isCalculating} onBack={() => setViewMode('plan')} />
+      ) : (
+      <div className="main" style={{ '--left-w': `${panelWidths.left}px`, '--right-w': `${panelWidths.right}px` }}>
         {/* LEFT: Setup */}
         <div className="panel">
           {diveMode === 'oc'
@@ -1762,6 +2374,8 @@ function App() {
           }
 
         </div>
+
+        <div className="resize-handle" onMouseDown={e => startPanelDrag('left', e)} title="Drag to resize" />
 
         {/* CENTER: Profile */}
         <div className="panel panel-center">
@@ -1812,12 +2426,8 @@ function App() {
           </div>
         </div>
 
-        {/* RIGHT: Results */}
-        <div className="panel">
-          <div className="section-title" style={{ marginBottom: 8 }}>Results</div>
-          <ResultsPanel results={results} isLoading={isCalculating} profileMode={profileMode} />
-        </div>
       </div>
+      )}
     </div>
   );
 }
