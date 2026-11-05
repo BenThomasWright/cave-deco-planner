@@ -610,7 +610,11 @@ function runSimulation(config) {
     }
     lastStepGasName = effectiveMode === 'ccr' ? 'Loop' : gasName(activeGas);
     logInterval += DT;
-    if (logInterval >= 1 || curT === 0) {
+    // Log every minute, at the start, and whenever the depth moves ≥0.5 m. The depth
+    // trigger captures cave vertices — a short ledge traversed in a few seconds would
+    // otherwise fall between the one-minute samples and vanish from both charts.
+    const depthMoved = lastLoggedDepth === null || Math.abs(depth - lastLoggedDepth) >= 0.5;
+    if (logInterval >= 1 || curT === 0 || depthMoved) {
       let ceiling = 0;
       if (gfLineParams) {
         const gf = Math.max(gfLineParams.gfLow, Math.min(gfLineParams.gfHigh,
@@ -620,11 +624,13 @@ function runSimulation(config) {
       }
       diveLog.push({ time: curT, depth, dist, cns: Math.round(cns), ceiling });
       logInterval = 0;
+      lastLoggedDepth = depth;
     }
   };
 
   const diveLog = [];
   let logInterval = 0;
+  let lastLoggedDepth = null;
   let exitDepth, bottomTimeMin;
   let curT = 0;
 
@@ -713,32 +719,44 @@ function runSimulation(config) {
         deepSectionSnapped = true;
       }
 
-      // Check if advancing to newCaveD would violate the GF ceiling at that depth.
-      const gfNew = Math.max(gfLowFrac, Math.min(gfHighFrac,
-        gfAt(newCaveD, firstStopDepth, gfLowFrac, gfHighFrac)));
-      const ceilBarNew = ceilingBar(tissues, gfNew);
-      const ceilingAtNew = ceilBarNew > SURFACE_P ? Math.max(0, barToM(ceilBarNew, salt)) : 0;
+      // GF ceiling at the diver's current depth (conservative; matches the open-water branch).
+      const gfCur = Math.max(gfLowFrac, Math.min(gfHighFrac,
+        gfAt(returnDepth, firstStopDepth, gfLowFrac, gfHighFrac)));
+      const ceilCurBar = ceilingBar(tissues, gfCur);
+      const ceilingNow = ceilCurBar > SURFACE_P ? Math.max(0, barToM(ceilCurBar, salt)) : 0;
 
       let stepDepth, stepOdo, isTravelStep;
       if (returnOdo >= maxReturnOdo) {
         // Exited cave — open water ascent to surface constrained by ceiling.
-        const gfCur = Math.max(gfLowFrac, Math.min(gfHighFrac,
-          gfAt(returnDepth, firstStopDepth, gfLowFrac, gfHighFrac)));
-        const ceilCur = Math.max(0, barToM(ceilingBar(tissues, gfCur), salt));
-        stepDepth = Math.max(ceilCur, returnDepth - ascentRate * DT);
-        if (stepDepth < 0.1 && ceilCur < 0.1) { stepDepth = 0; }
+        stepDepth = Math.max(ceilingNow, returnDepth - ascentRate * DT);
+        if (stepDepth < 0.1 && ceilingNow < 0.1) { stepDepth = 0; }
         stepOdo = maxReturnOdo;
         isTravelStep = stepDepth < returnDepth - 0.05; // ascending = travel
-      } else if (newCaveD >= ceilingAtNew - 0.5) {
-        // Cave at the next odo is at or below the GF ceiling there — advance.
+      } else if (newCaveD < returnDepth - 1e-6) {
+        // Ascending cave section. Follow the cave up at full cave speed — the diver's depth
+        // is always the cave depth — but never ascend past the deepest mandatory deco stop.
+        // Stops are discretised to standard 3 m increments: advance up the cave to the current
+        // stop depth, hold there until the ceiling clears the next 3 m, then step up the cave
+        // to the next stop. Produces a staircase that follows the passage, not the raw ceiling.
+        const stopDepthNow = ceilingNow > 0 ? Math.ceil(ceilingNow / 3) * 3 : 0;
+        if (newCaveD >= stopDepthNow) {
+          // Next cave point is at or below the current stop — safe to follow the cave.
+          stepDepth = newCaveD;
+          stepOdo = newOdo;
+          isTravelStep = true;
+        } else {
+          // Held at a deco stop: advance only to where the cave meets the stop depth
+          // (frac = 0 ⇒ a stationary hold), then wait for the ceiling to clear the next 3 m.
+          const frac = Math.max(0, Math.min(1, (returnDepth - stopDepthNow) / (returnDepth - newCaveD)));
+          stepDepth = stopDepthNow;
+          stepOdo = returnOdo + (newOdo - returnOdo) * frac;
+          isTravelStep = stepDepth < returnDepth - 0.05;
+        }
+      } else {
+        // Flat or descending cave — follow the cave (including back down into deeper passage).
         stepDepth = newCaveD;
         stepOdo = newOdo;
         isTravelStep = true;
-      } else {
-        // Cave would ascend past the ceiling — hold at current cave depth.
-        stepDepth = caveDepthAt(returnOdo);
-        stepOdo = returnOdo;
-        isTravelStep = false;
       }
 
       simStep(stepDepth, stepOdo, curT, isTravelStep);
@@ -1932,6 +1950,82 @@ function loadProfiles() {
 }
 function saveProfiles(profiles) {
   try { localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles)); } catch {}
+  autoSaveToFile(profiles);
+}
+
+// Merge two profile lists by id, keeping the most recently saved copy on collision.
+function mergeProfiles(a, b) {
+  const map = new Map();
+  for (const p of [...a, ...b]) {
+    if (!p || p.id == null) continue;
+    const ex = map.get(p.id);
+    if (!ex || (p.savedAt || 0) >= (ex.savedAt || 0)) map.set(p.id, p);
+  }
+  return [...map.values()].sort((x, y) => (y.savedAt || 0) - (x.savedAt || 0));
+}
+
+// ─── Durable file-backed auto-save (File System Access API) ──────────────────
+// localStorage on a file:// page is easily cleared by the browser, so profiles
+// are also mirrored to a real JSON file the user links once. The file handle is
+// kept in IndexedDB so it survives reloads; every saveProfiles() rewrites the file.
+const FS_SUPPORTED = typeof window !== 'undefined' && 'showSaveFilePicker' in window;
+const FS_IDB = { name: 'cave-deco-fs', store: 'handles', key: 'profiles-file' };
+let profileFileHandle = null;
+
+function fsIdbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(FS_IDB.name, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(FS_IDB.store);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function fsIdbGet(key) {
+  try {
+    const db = await fsIdbOpen();
+    return await new Promise((resolve, reject) => {
+      const r = db.transaction(FS_IDB.store, 'readonly').objectStore(FS_IDB.store).get(key);
+      r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+    });
+  } catch { return null; }
+}
+async function fsIdbSet(key, val) {
+  try {
+    const db = await fsIdbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(FS_IDB.store, 'readwrite');
+      tx.objectStore(FS_IDB.store).put(val, key);
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+    });
+  } catch {}
+}
+async function fsVerifyPermission(handle, write) {
+  const opts = { mode: write ? 'readwrite' : 'read' };
+  try {
+    if ((await handle.queryPermission(opts)) === 'granted') return true;
+    if ((await handle.requestPermission(opts)) === 'granted') return true;
+  } catch {}
+  return false;
+}
+async function fsWriteProfiles(handle, profiles) {
+  const w = await handle.createWritable();
+  await w.write(JSON.stringify(profiles, null, 2));
+  await w.close();
+}
+async function fsReadProfiles(handle) {
+  const text = await (await handle.getFile()).text();
+  const data = JSON.parse(text);
+  return Array.isArray(data) ? data : [];
+}
+// Fire-and-forget mirror of the current profiles to the linked file.
+function autoSaveToFile(profiles) {
+  if (!profileFileHandle) return;
+  (async () => {
+    try {
+      if (await fsVerifyPermission(profileFileHandle, true))
+        await fsWriteProfiles(profileFileHandle, profiles);
+    } catch {}
+  })();
 }
 
 function SaveModal({ defaultName, onSave, onClose }) {
@@ -1960,10 +2054,50 @@ function SaveModal({ defaultName, onSave, onClose }) {
 
 function LoadModal({ onLoad, onClose }) {
   const [profiles, setProfiles] = useState(loadProfiles);
+  const [fsName, setFsName] = useState(profileFileHandle ? profileFileHandle.name : null);
+  const [fsBusy, setFsBusy] = useState(false);
   const remove = (id) => {
     const updated = profiles.filter(p => p.id !== id);
     saveProfiles(updated);
     setProfiles(updated);
+  };
+  const enableAutoSave = async () => {
+    if (!FS_SUPPORTED) return;
+    setFsBusy(true);
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: 'cave-deco-profiles.json',
+        types: [{ description: 'JSON file', accept: { 'application/json': ['.json'] } }],
+      });
+      if (await fsVerifyPermission(handle, true)) {
+        profileFileHandle = handle;
+        await fsIdbSet(FS_IDB.key, handle);
+        let merged = loadProfiles();
+        try { merged = mergeProfiles(merged, await fsReadProfiles(handle)); } catch {}
+        saveProfiles(merged);
+        setProfiles(merged);
+        setFsName(handle.name);
+      }
+    } catch {}
+    setFsBusy(false);
+  };
+  const syncFromFile = async () => {
+    if (!profileFileHandle) return;
+    setFsBusy(true);
+    try {
+      if (await fsVerifyPermission(profileFileHandle, true)) {
+        const merged = mergeProfiles(loadProfiles(), await fsReadProfiles(profileFileHandle));
+        saveProfiles(merged);
+        setProfiles(merged);
+        setFsName(profileFileHandle.name);
+      }
+    } catch {}
+    setFsBusy(false);
+  };
+  const disableAutoSave = async () => {
+    profileFileHandle = null;
+    await fsIdbSet(FS_IDB.key, null);
+    setFsName(null);
   };
   const exportAll = async () => {
     const json = JSON.stringify(profiles, null, 2);
@@ -2002,7 +2136,23 @@ function LoadModal({ onLoad, onClose }) {
           <h2>Load Profile</h2>
           <button className="btn btn-sm" onClick={onClose}>✕</button>
         </div>
-        <div className="modal-body" style={{ padding: profiles.length === 0 ? '24px 20px' : '8px 12px' }}>
+        <div className="modal-body" style={{ padding: '8px 12px' }}>
+          {FS_SUPPORTED && (
+            <div style={{ padding: '10px', marginBottom: 8, background: 'rgba(127,127,127,0.1)', borderRadius: 8, fontSize: 12 }}>
+              {fsName ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ color: 'var(--success)' }}>● Auto-saving to <strong>{fsName}</strong></span>
+                  <button className="btn btn-sm" disabled={fsBusy} onClick={syncFromFile} title="Reload profiles from the file and merge">Sync now</button>
+                  <button className="btn btn-sm" disabled={fsBusy} onClick={disableAutoSave}>Unlink</button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ color: 'var(--muted)', flex: 1, minWidth: 180 }}>Browser storage can be cleared. Link a file to auto-save every change so profiles are never lost.</span>
+                  <button className="btn btn-sm btn-primary" disabled={fsBusy} onClick={enableAutoSave}>Enable auto-save to file…</button>
+                </div>
+              )}
+            </div>
+          )}
           {profiles.length === 0 ? (
             <div style={{ color: 'var(--muted)', fontSize: 13, textAlign: 'center' }}>No saved profiles yet.</div>
           ) : profiles.map(p => (
@@ -2203,6 +2353,23 @@ function App() {
     try { const s = JSON.parse(localStorage.getItem('deco-panel-widths') || '{}'); return { left: s.left || 280, right: s.right || 300 }; }
     catch { return { left: 280, right: 300 }; }
   });
+
+  // Reconnect the linked profiles file on startup and merge it back into local storage,
+  // so profiles survive the browser clearing its storage between sessions.
+  useEffect(() => {
+    if (!FS_SUPPORTED) return;
+    (async () => {
+      const handle = await fsIdbGet(FS_IDB.key);
+      if (!handle) return;
+      profileFileHandle = handle;
+      try {
+        if ((await handle.queryPermission({ mode: 'readwrite' })) === 'granted') {
+          const merged = mergeProfiles(loadProfiles(), await fsReadProfiles(handle));
+          localStorage.setItem(PROFILES_KEY, JSON.stringify(merged));
+        }
+      } catch {}
+    })();
+  }, []);
 
   // Switch profile mode
   const handleProfileMode = (m) => {
