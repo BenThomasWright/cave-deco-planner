@@ -1,0 +1,505 @@
+[
+  {
+    "id": 1793893771280,
+    "name": "Hurtle to the Deep",
+    "savedAt": 1793893771280,
+    "diveMode": "oc",
+    "profileMode": "cave",
+    "waypoints": [
+      {
+        "x": 0,
+        "y": 0,
+        "scooter": false
+      },
+      {
+        "x": 50,
+        "y": 18,
+        "scooter": false
+      },
+      {
+        "x": 100,
+        "y": 28,
+        "scooter": false
+      },
+      {
+        "x": 120,
+        "y": 12,
+        "scooter": false
+      },
+      {
+        "x": 170,
+        "y": 20,
+        "scooter": false
+      },
+      {
+        "x": 220,
+        "y": 25,
+        "scooter": false
+      },
+      {
+        "x": 270,
+        "y": 35,
+        "scooter": false
+      },
+      {
+        "x": 320,
+        "y": 35,
+        "scooter": false
+      },
+      {
+        "x": 370,
+        "y": 30,
+        "scooter": false
+      },
+      {
+        "x": 420,
+        "y": 35,
+        "scooter": false
+      },
+      {
+        "x": 470,
+        "y": 30,
+        "scooter": false
+      },
+      {
+        "x": 520,
+        "y": 35,
+        "scooter": false
+      },
+      {
+        "x": 570,
+        "y": 35,
+        "scooter": false
+      },
+      {
+        "x": 620,
+        "y": 25,
+        "scooter": false
+      },
+      {
+        "x": 670,
+        "y": 20,
+        "scooter": false
+      },
+      {
+        "x": 720,
+        "y": 12,
+        "scooter": false
+      },
+      {
+        "x": 740,
+        "y": 28,
+        "scooter": false
+      },
+      {
+        "x": 790,
+        "y": 18,
+        "scooter": false
+      },
+      {
+        "x": 840,
+        "y": 0,
+        "scooter": false
+      }
+    ],
+    "oc": {
+      "bottomGas": {
+        "fO2": 0.21,
+        "fHe": 0,
+        "size": 41,
+        "fillPressure": 250
+      },
+      "decoGases": [
+        {
+          "fO2": 1,
+          "fHe": 0,
+          "size": 2,
+          "switchDepth": 6,
+          "dropDist": 10
+        }
+      ]
+    },
+    "ccr": {
+      "setpoint": 1.3,
+      "decoSetpoint": 1.3,
+      "diluent": {
+        "fO2": 0.21,
+        "fHe": 0,
+        "size": 3,
+        "fillPressure": 200
+      },
+      "bailout": {
+        "fO2": 0.21,
+        "fHe": 0,
+        "size": 7,
+        "dropDist": 0,
+        "fillPressure": 200
+      },
+      "bailoutAt": "",
+      "decoBailouts": [
+        {
+          "fO2": 0.5,
+          "fHe": 0,
+          "size": 3,
+          "switchDepth": 21,
+          "dropDist": 0,
+          "fillPressure": 200
+        }
+      ]
+    }
+  },
+  {
+    "id": 1793884273737,
+    "name": "Ressel - 4th T",
+    "savedAt": 1793884273737,
+    "diveMode": "ccr",
+    "profileMode": "cave",
+    "waypoints": [
+      {
+        "x": 1,
+        "y": 0,
+        "scooter": true
+      },
+      {
+        "x": 10,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 180,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 255,
+        "y": 18,
+        "scooter": true
+      },
+      {
+        "x": 358,
+        "y": 20,
+        "scooter": true
+      },
+      {
+        "x": 360,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 370,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 380,
+        "y": 42,
+        "scooter": true
+      },
+      {
+        "x": 440,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 490,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 830,
+        "y": 55,
+        "scooter": true
+      },
+      {
+        "x": 1000,
+        "y": 55,
+        "scooter": true
+      },
+      {
+        "x": 1160,
+        "y": 60,
+        "scooter": false
+      },
+      {
+        "x": 1320,
+        "y": 55,
+        "scooter": true
+      },
+      {
+        "x": 1490,
+        "y": 55,
+        "scooter": true
+      },
+      {
+        "x": 1830,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 1880,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 1940,
+        "y": 42,
+        "scooter": true
+      },
+      {
+        "x": 1950,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 1960,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 1962,
+        "y": 20,
+        "scooter": true
+      },
+      {
+        "x": 2065,
+        "y": 18,
+        "scooter": true
+      },
+      {
+        "x": 2140,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 2310,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 2319,
+        "y": 0,
+        "scooter": true
+      }
+    ],
+    "oc": {
+      "bottomGas": {
+        "fO2": 0.21,
+        "fHe": 0,
+        "size": 24,
+        "fillPressure": 200
+      },
+      "decoGases": [
+        {
+          "fO2": 0.5,
+          "fHe": 0,
+          "size": 11,
+          "switchDepth": 21,
+          "dropDist": 0,
+          "fillPressure": 200
+        }
+      ]
+    },
+    "ccr": {
+      "setpoint": 1.2,
+      "decoSetpoint": 1.3,
+      "diluent": {
+        "fO2": 0.1,
+        "fHe": 0.7,
+        "size": 3,
+        "fillPressure": 200
+      },
+      "bailout": {
+        "fO2": 0.15,
+        "fHe": 0.55,
+        "size": 24,
+        "dropDist": 0,
+        "fillPressure": 200
+      },
+      "bailoutAt": "",
+      "decoBailouts": [
+        {
+          "fO2": 1,
+          "fHe": 0,
+          "size": 11,
+          "switchDepth": 6,
+          "dropDist": 100,
+          "fillPressure": 200
+        },
+        {
+          "fO2": 0.5,
+          "fHe": 0,
+          "size": 3,
+          "switchDepth": 21,
+          "dropDist": 300
+        }
+      ]
+    }
+  },
+  {
+    "id": 1793884230480,
+    "name": "Ressel 3rd T",
+    "savedAt": 1793884230480,
+    "diveMode": "ccr",
+    "profileMode": "cave",
+    "waypoints": [
+      {
+        "x": 1,
+        "y": 0,
+        "scooter": true
+      },
+      {
+        "x": 10,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 180,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 255,
+        "y": 18,
+        "scooter": true
+      },
+      {
+        "x": 358,
+        "y": 20,
+        "scooter": true
+      },
+      {
+        "x": 360,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 370,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 380,
+        "y": 42,
+        "scooter": true
+      },
+      {
+        "x": 440,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 490,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 830,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 1170,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 1220,
+        "y": 50,
+        "scooter": true
+      },
+      {
+        "x": 1280,
+        "y": 42,
+        "scooter": true
+      },
+      {
+        "x": 1290,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 1300,
+        "y": 30,
+        "scooter": true
+      },
+      {
+        "x": 1302,
+        "y": 20,
+        "scooter": true
+      },
+      {
+        "x": 1405,
+        "y": 18,
+        "scooter": true
+      },
+      {
+        "x": 1480,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 1650,
+        "y": 10,
+        "scooter": true
+      },
+      {
+        "x": 1659,
+        "y": 0,
+        "scooter": true
+      }
+    ],
+    "oc": {
+      "bottomGas": {
+        "fO2": 0.21,
+        "fHe": 0,
+        "size": 24,
+        "fillPressure": 200
+      },
+      "decoGases": [
+        {
+          "fO2": 0.5,
+          "fHe": 0,
+          "size": 11,
+          "switchDepth": 21,
+          "dropDist": 0,
+          "fillPressure": 200
+        }
+      ]
+    },
+    "ccr": {
+      "setpoint": 1.2,
+      "decoSetpoint": 1.3,
+      "diluent": {
+        "fO2": 0.1,
+        "fHe": 0.7,
+        "size": 3,
+        "fillPressure": 200
+      },
+      "bailout": {
+        "fO2": 0.15,
+        "fHe": 0.55,
+        "size": 24,
+        "dropDist": 0,
+        "fillPressure": 200
+      },
+      "bailoutAt": "830",
+      "decoBailouts": [
+        {
+          "fO2": 1,
+          "fHe": 0,
+          "size": 11,
+          "switchDepth": 6,
+          "dropDist": 100,
+          "fillPressure": 200
+        },
+        {
+          "fO2": 0.5,
+          "fHe": 0,
+          "size": 3,
+          "switchDepth": 21,
+          "dropDist": 300
+        }
+      ]
+    }
+  }
+]
